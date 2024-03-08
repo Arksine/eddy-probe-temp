@@ -11,3 +11,6 @@ start_moonraker
 .pdm-python
 build
 dist
+data-samples*.json
+*.json
+*.png
