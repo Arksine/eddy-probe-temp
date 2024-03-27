@@ -128,8 +128,10 @@ options:
                         Output file path
 ```
 
-The `graph-composite` will generate a single, composite plot multiple graphs
-from `data-sample` files saved in the repo (or optionally the INPUT DIRECTORY).
-if `-o` is specified the graph will be saved to an image file, otherwise
-matplotlib will launch a live preview.
+The `graph-composite` will generate a single, composite plot containing
+multiple graphs generated from `data-sample-{desc}.json` files saved in
+the repo directory. If `-o` is specified the graph will be saved to an
+image file, otherwise matplotlib will launch a live preview.  The `-i`
+option may be used to read `data-sample` files from a directory other
+than the repo folder.
 
