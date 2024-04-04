@@ -11,15 +11,18 @@ import pathlib
 import time
 import re
 import json
+import bisect
 from threading import Thread
 from collections import deque
 import websockets
 import plotly.express as px
+import plotly.graph_objects as go
 import pandas as pd
 from numpy.polynomial import Polynomial
 from dash import Dash, dcc, html, Input, Output, callback
 from typing import Dict, Any, Optional, Tuple, List, Callable, Awaitable
 
+plot_height = False
 app = Dash("Eddy Probe Drift Analyzer")
 app.layout = html.Div([
     html.H4("Probe Frequency Drift"),
@@ -37,24 +40,37 @@ app.layout = html.Div([
 )
 def update_drift_graph(n):
     pdata = list(KlippyBridgeConnection.probe_data)
-    df = pd.DataFrame({
-        "temperature": [p[0] for p in pdata],
-        "frequency": [p[1] for p in pdata]
-    })
-    fig = px.scatter(df, x="temperature", y="frequency")
+    temp = [p[0] for p in pdata]
+    if plot_height:
+        height = [round(p[2], 6) for p in pdata]
+        stock_height = [round(p[3], 6) for p in pdata]
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=temp, y=height, mode="markers", name="corrected height"
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=temp, y=stock_height, mode="markers", name="stock height"
+            )
+        )
+    else:
+        df = pd.DataFrame({
+            "temperature": temp,
+            "frequency": [p[1] for p in pdata]
+        })
+        fig = px.scatter(df, x="temperature", y="frequency")
     return fig
 
 
 INFO_REQUEST = "info"
 SUB_REQUEST = "objects/subscribe"
+QUERY_REQUEST = "objects/query"
 DUMP_PROBE_REQUEST = "ldc1612/dump_ldc1612"
 SENSOR_NAME = "btt_eddy"
-TEMP_SENSOR_NAME = "probe_drift"
+TEMP_SENSOR_NAME = "probe_drift_adjust"
 REQ_UPDATE_TIME = 60.
-
-# TODO:
-# Plot (use plotly?  Use Dash?)
-
 class KlippyBridgeConnection:
     probe_data = deque(maxlen=10000)
 
@@ -74,7 +90,32 @@ class KlippyBridgeConnection:
         if args.temp_sensor is not None:
             self.temp_sensor_name = f"temperature_sensor {args.temp_sensor}"
         self.need_collect_ldc = False
+        self.stock_cal_freqs = []
+        self.stock_cal_zpos = []
         self.conn_task: Optional[asyncio.Task] = None
+
+    def load_ldc1612_calibration(self, cal):
+        cal = sorted([(c[1], c[0]) for c in cal])
+        self.stock_cal_freqs = [c[0] for c in cal]
+        self.stock_cal_zpos = [c[1] for c in cal]
+
+    def height_from_freq(self, freq):
+        if not self.stock_cal_freqs or not self.stock_cal_zpos:
+            return 99.0
+        pos = bisect.bisect(self.stock_cal_freqs, freq)
+        if pos >= len(self.stock_cal_zpos):
+            zpos = -99.9
+        elif pos == 0:
+            zpos = 99.9
+        else:
+            this_freq = self.stock_cal_freqs[pos]
+            prev_freq = self.stock_cal_freqs[pos - 1]
+            this_zpos = self.stock_cal_zpos[pos]
+            prev_zpos = self.stock_cal_zpos[pos - 1]
+            gain = (this_zpos - prev_zpos) / (this_freq - prev_freq)
+            offset = prev_zpos - prev_freq * gain
+            zpos = freq * gain + offset
+        return zpos
 
     async def start_connection(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -103,6 +144,27 @@ class KlippyBridgeConnection:
         )
         await ws.send(info_req)
         await fut
+        print("Loading stock ldc1612 Calibration...")
+        query_req, fut = self._build_request(
+            QUERY_REQUEST, {"objects": {"configfile": ["settings"]}}
+        )
+        await ws.send(query_req)
+        result: Dict[str, Any] = await fut
+        cfg_status: Dict[str, Any] = result.get("status", {}).get("configfile", {})
+        config: Dict[str, Any] = cfg_status.get("settings", {})
+        probe_cfg: Dict[str, Any]
+        probe_cfg = config.get(f"probe_eddy_current {self.sensor_name}", {})
+        probe_cal: str = probe_cfg.get("calibrate")
+        if probe_cal is not None:
+            cal = [
+                list(map(float, d.strip().split(':', 1)))
+                for d in probe_cal.split(',')
+            ]
+            self.load_ldc1612_calibration(cal)
+            print("Successfully loaded ldc1612 calibration")
+        else:
+            print("Failed to load ldc1612 calibration")
+
         print(f"Subscribing to temperature updates for [{self.temp_sensor_name}]")
         temp_sub, fut = self._build_request(
             SUB_REQUEST,
@@ -112,7 +174,7 @@ class KlippyBridgeConnection:
             }
         )
         await ws.send(temp_sub)
-        result: Dict[str, Any] = await fut
+        result = await fut
         eventtime = result["eventtime"]
         temp = result["status"][self.temp_sensor_name]["temperature"]
         self.last_temp = (temp, eventtime)
@@ -198,11 +260,13 @@ class KlippyBridgeConnection:
         # LDC data comes in the format of [eventtime, freq, calculated_z]
         avg_freq = sum([d[1] for d in ldc_queue]) / len(ldc_queue)
         avg_z = sum([d[2] for d in ldc_queue]) / len(ldc_queue)
-        self.probe_data.append((temp, avg_freq))
+        stock_z = self.height_from_freq(avg_freq)
+        self.probe_data.append((temp, avg_freq, avg_z, stock_z))
         self.ldc_data_queue.clear()
         self.print_async(
             "Eddy Frequency Data Updated\n"
-            f"Temp: {temp:.2f} Freq: {avg_freq:.8f}, Z: {avg_z:.6f}"
+            f"Temp: {temp:.2f} Freq: {avg_freq:.8f}, Z: {avg_z:.6f} "
+            f"Stock Z: {stock_z:.6f}"
         )
 
     def print_async(self, msg: str):
@@ -258,7 +322,7 @@ def dump_samples(desc: Optional[str]):
             "repr": poly_str,
             "coefficients": coefs
         },
-        "legend": ["temperature", "frequency"],
+        "legend": ["temperature", "frequency", "height"],
         "samples": list(pdata)
     }
     postfix = desc or time.strftime("%Y%m%d_%H%M%S")
@@ -291,10 +355,17 @@ def main():
         help="Description for output file"
     )
     parser.add_argument(
+        "-z", "--plot-z", action="store_true",
+        help="plot z height instead of freqency"
+    )
+    parser.add_argument(
         "url", metavar="<moonraker url>",
         help="URL to Moonraker instance"
     )
     args = parser.parse_args()
+    if args.plot_z:
+        global plot_height
+        plot_height = True
     conn = KlippyBridgeConnection(args)
     conn_thread = Thread(target=start_klippy_connection, args=[conn])
     conn_thread.start()
