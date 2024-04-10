@@ -68,6 +68,7 @@ INFO_REQUEST = "info"
 SUB_REQUEST = "objects/subscribe"
 QUERY_REQUEST = "objects/query"
 DUMP_PROBE_REQUEST = "ldc1612/dump_ldc1612"
+DUMP_BEACON_REQUEST = "beacon/dump"
 SENSOR_NAME = "btt_eddy"
 TEMP_SENSOR_NAME = "probe_drift_adjust"
 REQ_UPDATE_TIME = 60.
@@ -87,6 +88,7 @@ class KlippyBridgeConnection:
         self.bridge_url = f"{scheme}://{host}/klippysocket"
         self.sensor_name = args.eddy_sensor
         self.temp_sensor_name = TEMP_SENSOR_NAME
+        self.has_beacon = self.sensor_name == "beacon"
         if args.temp_sensor is not None:
             self.temp_sensor_name = f"temperature_sensor {args.temp_sensor}"
         self.need_collect_ldc = False
@@ -144,55 +146,67 @@ class KlippyBridgeConnection:
         )
         await ws.send(info_req)
         await fut
-        print("Loading stock ldc1612 Calibration...")
-        query_req, fut = self._build_request(
-            QUERY_REQUEST, {"objects": {"configfile": ["settings"]}}
-        )
-        await ws.send(query_req)
-        result: Dict[str, Any] = await fut
-        cfg_status: Dict[str, Any] = result.get("status", {}).get("configfile", {})
-        config: Dict[str, Any] = cfg_status.get("settings", {})
-        probe_cfg: Dict[str, Any]
-        probe_cfg = config.get(f"probe_eddy_current {self.sensor_name}", {})
-        probe_cal: str = probe_cfg.get("calibrate")
-        if probe_cal is not None:
-            cal = [
-                list(map(float, d.strip().split(':', 1)))
-                for d in probe_cal.split(',')
-            ]
-            self.load_ldc1612_calibration(cal)
-            print("Successfully loaded ldc1612 calibration")
+        if self.has_beacon:
+            print("Requesting Beacon Dump Endpoint...")
+            self.need_collect_ldc = False
+            dump_req, fut = self._build_request(
+                DUMP_BEACON_REQUEST,
+                {"response_template": {"method": "beacon_update"}}
+            )
+            await ws.send(dump_req)
+            await fut
         else:
-            print("Failed to load ldc1612 calibration")
+            print("Loading stock ldc1612 Calibration...")
+            query_req, fut = self._build_request(
+                QUERY_REQUEST, {"objects": {"configfile": ["settings"]}}
+            )
+            await ws.send(query_req)
+            result: Dict[str, Any] = await fut
+            cfg_status: Dict[str, Any] = result.get("status", {}).get("configfile", {})
+            config: Dict[str, Any] = cfg_status.get("settings", {})
+            probe_cfg: Dict[str, Any]
+            probe_cfg = config.get(f"probe_eddy_current {self.sensor_name}", {})
+            probe_cal: str = probe_cfg.get("calibrate")
+            if probe_cal is not None:
+                cal = [
+                    list(map(float, d.strip().split(':', 1)))
+                    for d in probe_cal.split(',')
+                ]
+                self.load_ldc1612_calibration(cal)
+                print("Successfully loaded ldc1612 calibration")
+            else:
+                print("Failed to load ldc1612 calibration")
 
-        print(f"Subscribing to temperature updates for [{self.temp_sensor_name}]")
-        temp_sub, fut = self._build_request(
-            SUB_REQUEST,
-            {
-                "objects": {self.temp_sensor_name: ["temperature"]},
-                "response_template": {"method": "status_update"}
-            }
-        )
-        await ws.send(temp_sub)
-        result = await fut
-        eventtime = result["eventtime"]
-        temp = result["status"][self.temp_sensor_name]["temperature"]
-        self.last_temp = (temp, eventtime)
-        self.need_collect_ldc = True
-        dump_req, fut = self._build_request(
-            DUMP_PROBE_REQUEST,
-            {
-                "sensor": self.sensor_name,
-                "response_template": {"method": "ldc1612_update"}
-            }
-        )
-        await ws.send(dump_req)
-        await fut
+            print(f"Subscribing to temperature updates for [{self.temp_sensor_name}]")
+            temp_sub, fut = self._build_request(
+                SUB_REQUEST,
+                {
+                    "objects": {self.temp_sensor_name: ["temperature"]},
+                    "response_template": {"method": "status_update"}
+                }
+            )
+            await ws.send(temp_sub)
+            result = await fut
+            eventtime = result["eventtime"]
+            temp = result["status"][self.temp_sensor_name]["temperature"]
+            self.last_temp = (temp, eventtime)
+            self.need_collect_ldc = True
+            dump_req, fut = self._build_request(
+                DUMP_PROBE_REQUEST,
+                {
+                    "sensor": self.sensor_name,
+                    "response_template": {"method": "ldc1612_update"}
+                }
+            )
+            await ws.send(dump_req)
+            await fut
 
     def _process_response(self, response: Dict[str, Any]) -> None:
         if "method" in response:
             method = response["method"]
             params = response.get("params", {})
+            if isinstance(params, list):
+                params = {"data": params}
             asyncio.create_task(self._execute_method(method, **params))
             return
         req_id: Optional[int] = response.get("id")
@@ -257,17 +271,49 @@ class KlippyBridgeConnection:
         self.need_collect_ldc = False
         temp, evttime = self.last_temp
         ldc_queue = self.ldc_data_queue
-        # LDC data comes in the format of [eventtime, freq, calculated_z]
-        avg_freq = sum([d[1] for d in ldc_queue]) / len(ldc_queue)
-        avg_z = sum([d[2] for d in ldc_queue]) / len(ldc_queue)
-        stock_z = self.height_from_freq(avg_freq)
+        if self.has_beacon:
+            # Beacon data comes in the format of [dist, temp, pos, freq, vel, eventtime]
+            avg_freq = sum([d[3] for d in ldc_queue]) / len(ldc_queue)
+            z_vals = [d[2] for d in ldc_queue if d[2] is not None]
+            if z_vals:
+                avg_z = sum(z_vals) / len(ldc_queue)
+            else:
+                avg_z = 99.
+            stock_z = 99.
+            self.print_async(
+                "Beacon Frequency Data Updated\n"
+                f"Temp: {temp:.2f} Freq: {avg_freq:.8f}, Z: {avg_z:.6f}"
+            )
+        else:
+            # LDC data comes in the format of [eventtime, freq, calculated_z]
+            avg_freq = sum([d[1] for d in ldc_queue]) / len(ldc_queue)
+            avg_z = sum([d[2] for d in ldc_queue]) / len(ldc_queue)
+            stock_z = self.height_from_freq(avg_freq)
+            self.print_async(
+                "Eddy Frequency Data Updated\n"
+                f"Temp: {temp:.2f} Freq: {avg_freq:.8f}, Z: {avg_z:.6f} "
+                f"Stock Z: {stock_z:.6f}"
+            )
         self.probe_data.append((temp, avg_freq, avg_z, stock_z))
         self.ldc_data_queue.clear()
-        self.print_async(
-            "Eddy Frequency Data Updated\n"
-            f"Temp: {temp:.2f} Freq: {avg_freq:.8f}, Z: {avg_z:.6f} "
-            f"Stock Z: {stock_z:.6f}"
-        )
+
+    def _process_beacon_update(self, data: List[List[float]]):
+        if self.need_collect_ldc:
+            self.ldc_data_queue.extend(data)
+            if len(self.ldc_data_queue) >= 50:
+                self._collect_samples()
+            return
+        last_temp, last_evt = self.last_temp
+        for i, sample in enumerate(data):
+            _, temp, _, _, _, evttime = sample
+            if temp >= last_temp + 1. or evttime > last_evt + REQ_UPDATE_TIME:
+                self.print_async(
+                    f"Temp update: Last temp: {last_temp}, New Temp: {temp}"
+                )
+                self.last_temp = (temp, evttime)
+                self.need_collect_ldc = True
+                self.ldc_data_queue.extend(data[i:])
+                break
 
     def print_async(self, msg: str):
         self._loop.run_in_executor(None, print, msg)
