@@ -70,10 +70,10 @@ QUERY_REQUEST = "objects/query"
 DUMP_PROBE_REQUEST = "ldc1612/dump_ldc1612"
 DUMP_BEACON_REQUEST = "beacon/dump"
 SENSOR_NAME = "btt_eddy"
-TEMP_SENSOR_NAME = "probe_drift_adjust"
+TEMP_SENSOR_NAME = "temperature_probe btt_eddy"
 REQ_UPDATE_TIME = 60.
 class KlippyBridgeConnection:
-    probe_data = deque(maxlen=10000)
+    probe_data: deque[tuple[float, ...]] = deque(maxlen=10000)
 
     def __init__(self, args: argparse.Namespace) -> None:
         url_match = re.match(r"((?:https?)|(?:wss?))://(.+)", args.url.lower())
@@ -83,17 +83,15 @@ class KlippyBridgeConnection:
         host = url_match.group(2).rstrip("/")
         scheme = scheme.replace("http", "ws")
         self.pending_requests: Dict[int, asyncio.Future] = {}
-        self.ldc_data_queue = deque(maxlen=100)
+        self.ldc_data_queue: deque[List[float]]  = deque(maxlen=100)
         self.last_temp: Tuple[float, float] = (0, 0)
         self.bridge_url = f"{scheme}://{host}/klippysocket"
         self.sensor_name = args.eddy_sensor
-        self.temp_sensor_name = TEMP_SENSOR_NAME
         self.has_beacon = self.sensor_name == "beacon"
-        if args.temp_sensor is not None:
-            self.temp_sensor_name = f"temperature_sensor {args.temp_sensor}"
+        self.temp_sensor_name = f"temperature_probe {self.sensor_name}"
         self.need_collect_ldc = False
-        self.stock_cal_freqs = []
-        self.stock_cal_zpos = []
+        self.stock_cal_freqs: List[float] = []
+        self.stock_cal_zpos: List[float] = []
         self.conn_task: Optional[asyncio.Task] = None
 
     def load_ldc1612_calibration(self, cal):
@@ -166,7 +164,7 @@ class KlippyBridgeConnection:
             config: Dict[str, Any] = cfg_status.get("settings", {})
             probe_cfg: Dict[str, Any]
             probe_cfg = config.get(f"probe_eddy_current {self.sensor_name}", {})
-            probe_cal: str = probe_cfg.get("calibrate")
+            probe_cal: Optional[str] = probe_cfg.get("calibrate")
             if probe_cal is not None:
                 cal = [
                     list(map(float, d.strip().split(':', 1)))
@@ -230,7 +228,7 @@ class KlippyBridgeConnection:
     ) -> Tuple[str, asyncio.Future]:
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        req = {"method": method}
+        req: Dict[str, Any] = {"method": method}
         if params:
             req["params"] = params
         req["id"] = id(fut)
@@ -274,15 +272,20 @@ class KlippyBridgeConnection:
         if self.has_beacon:
             # Beacon data comes in the format of [dist, temp, pos, freq, vel, eventtime]
             avg_freq = sum([d[3] for d in ldc_queue]) / len(ldc_queue)
-            z_vals = [d[2] for d in ldc_queue if d[2] is not None]
+            z_vals = [d[0] for d in ldc_queue if d[0] is not None]
             if z_vals:
                 avg_z = sum(z_vals) / len(ldc_queue)
             else:
                 avg_z = 99.
-            stock_z = 99.
+            stock_z = avg_z
+            if len(ldc_queue[0]) == 7:
+                raw_z_vals = [d[6] for d in ldc_queue if d[6] is not None]
+                if raw_z_vals:
+                    stock_z = sum(raw_z_vals) / len(raw_z_vals)
             self.print_async(
                 "Beacon Frequency Data Updated\n"
-                f"Temp: {temp:.2f} Freq: {avg_freq:.8f}, Z: {avg_z:.6f}"
+                f"Temp: {temp:.2f} Freq: {avg_freq:.8f}, Z: {avg_z:.6f} "
+                f"Stock Z: {stock_z:.6f}"
             )
         else:
             # LDC data comes in the format of [eventtime, freq, calculated_z]
@@ -305,7 +308,8 @@ class KlippyBridgeConnection:
             return
         last_temp, last_evt = self.last_temp
         for i, sample in enumerate(data):
-            _, temp, _, _, _, evttime = sample
+            temp = sample[1]
+            evttime = sample[5]
             if temp >= last_temp + 1. or evttime > last_evt + REQ_UPDATE_TIME:
                 self.print_async(
                     f"Temp update: Last temp: {last_temp}, New Temp: {temp}"
@@ -350,7 +354,7 @@ def fit_poly():
     if len(x) < 3:
         return [], "Failed to fit polynomial"
     try:
-        poly = Polynomial.fit(x, y, 1).convert()
+        poly = Polynomial.fit(x, y, 2).convert()
     except Exception:
         return [], "Failed to fit polynomial"
     # Convert to string
@@ -368,7 +372,7 @@ def dump_samples(desc: Optional[str]):
             "repr": poly_str,
             "coefficients": coefs
         },
-        "legend": ["temperature", "frequency", "height"],
+        "legend": ["temperature", "frequency", "height", "stock_height"],
         "samples": list(pdata)
     }
     postfix = desc or time.strftime("%Y%m%d_%H%M%S")
@@ -389,10 +393,6 @@ def main():
         help="Name of the eddy current sensor config object"
     )
     parser.add_argument(
-        "-t", "--temp-sensor", default=None,
-        help="Name of the temperature sensor config object"
-    )
-    parser.add_argument(
         "-a", "--dash-addr", default="127.0.0.1:8050",
         help="Address to bind dash server to"
     )
@@ -402,7 +402,7 @@ def main():
     )
     parser.add_argument(
         "-z", "--plot-z", action="store_true",
-        help="plot z height instead of freqency"
+        help="plot z height"
     )
     parser.add_argument(
         "url", metavar="<moonraker url>",
