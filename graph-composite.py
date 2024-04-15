@@ -15,22 +15,22 @@ import numpy as np
 from numpy.polynomial import Polynomial
 from typing import List
 
-def poly_to_str(coef):
-    out = "y(x) = "
-    deg = len(coef) - 1
-    for i, c in enumerate(reversed(coef)):
-        if int(c) == c:
-            c == int(c)
-        if c == 0:
+def poly_to_str(coefs):
+    parts = ["y(x) = "]
+    deg = len(coefs) - 1
+    for i, coef in enumerate(reversed(coefs)):
+        if round(coef, 8) == int(coef):
+            coef == int(coef)
+        if abs(coef) < 1e-10:
             continue
         cur_deg = deg - i
-        x_str = f"x^{cur_deg}" if cur_deg else ""
-        if i == 0:
-            out = f"{out}{c}{x_str}"
+        x_str = "x^%d" % (cur_deg,) if cur_deg > 1 else "x" * cur_deg
+        if len(parts) == 1:
+            parts.append("%f%s" % (coef, x_str))
         else:
-            sym = "-" if c < 0 else "+"
-            out = f"{out} {sym} {abs(c)}{x_str}"
-    return out
+            sym = "-" if coef < 0 else "+"
+            parts.append("%s %f%s" % (sym, abs(coef), x_str))
+    return " ".join(parts)
 
 def plot_saved_data(dpath: pathlib.Path):
     desc_m = re.match(r"data-samples-(.+)\.json", dpath.name)
@@ -47,6 +47,7 @@ def plot_saved_data(dpath: pathlib.Path):
     plt.plot(x, y, ".", label=desc)
     plt.plot(px, py, "-", label=f"y = {round(coef[1], 4)}x")
     print(f"{desc} polynomial: {poly_to_str(coef)}")
+    print(f"Coefs: {tuple(coef)}")
 
 def plot_slope_data(pathlist: List[pathlib.Path]):
     start_temp = 0
@@ -186,6 +187,8 @@ def main():
     args = parser.parse_args()
     if args.output is not None:
         matplotlib.use("Agg")
+    else:
+        matplotlib.use("GTK4Agg")
     if args.drift_dump is not None:
         dd_path = pathlib.Path(args.drift_dump).expanduser().resolve()
         plot_drift_dump(dd_path, args)
