@@ -133,6 +133,10 @@ options:
                         Path to input directory
   -o OUTPUT, --output OUTPUT
                         Output file path
+  -s, --plot-slope      Plot slope
+  -e, --plot-error      Plot slope
+  -d DRIFT_DUMP, --drift-dump DRIFT_DUMP
+                        Plot Klipper drift calibration dump file
 ```
 
 The `graph-composite` will generate a single, composite plot containing
@@ -142,3 +146,5 @@ image file, otherwise matplotlib will launch a live preview.  The `-i`
 option may be used to read `data-sample` files from a directory other
 than the repo folder.
 
+In addition, `graph-composite.py` can plot Klipper drift calibration
+dumps using the `-d` option.
