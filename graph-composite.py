@@ -187,8 +187,6 @@ def main():
     args = parser.parse_args()
     if args.output is not None:
         matplotlib.use("Agg")
-    else:
-        matplotlib.use("GTK4Agg")
     if args.drift_dump is not None:
         dd_path = pathlib.Path(args.drift_dump).expanduser().resolve()
         plot_drift_dump(dd_path, args)
