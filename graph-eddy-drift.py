@@ -22,6 +22,8 @@ from numpy.polynomial import Polynomial
 from dash import Dash, dcc, html, Input, Output, callback
 from typing import Dict, Any, Optional, Tuple, List, Callable, Awaitable
 
+from websockets import WebSocketClientProtocol as WSProto
+
 plot_height = False
 app = Dash("Eddy Probe Drift Analyzer")
 app.layout = html.Div([
@@ -55,6 +57,11 @@ def update_drift_graph(n):
                 x=temp, y=stock_height, mode="markers", name="stock height"
             )
         )
+        fig.update_layout(
+            title="Eddy Probe Drift Correction",
+            xaxis_title="Temperature",
+            yaxis_title="Z Height"
+        )
     else:
         df = pd.DataFrame({
             "temperature": temp,
@@ -67,11 +74,24 @@ def update_drift_graph(n):
 INFO_REQUEST = "info"
 SUB_REQUEST = "objects/subscribe"
 QUERY_REQUEST = "objects/query"
+GCODE_REQUEST = "gcode/script"
 DUMP_PROBE_REQUEST = "ldc1612/dump_ldc1612"
 DUMP_BEACON_REQUEST = "beacon/dump"
 SENSOR_NAME = "btt_eddy"
 TEMP_SENSOR_NAME = "temperature_probe btt_eddy"
 REQ_UPDATE_TIME = 60.
+MOUNTED_UPDATE_TIME = 30.
+
+MOUNTED_SCRIPT = \
+"""
+G91
+G1 Z2 F600
+G90
+PROBE
+G4 P400
+M400
+"""
+
 class KlippyBridgeConnection:
     probe_data: deque[tuple[float, ...]] = deque(maxlen=10000)
 
@@ -93,6 +113,8 @@ class KlippyBridgeConnection:
         self.stock_cal_freqs: List[float] = []
         self.stock_cal_zpos: List[float] = []
         self.conn_task: Optional[asyncio.Task] = None
+        self.is_mounted = args.mounted
+        self.ws: Optional[WSProto] = None
 
     def load_ldc1612_calibration(self, cal):
         cal = sorted([(c[1], c[0]) for c in cal])
@@ -129,6 +151,7 @@ class KlippyBridgeConnection:
 
     async def _do_connect(self) -> None:
         async with websockets.connect(self.bridge_url) as ws:
+            self.ws = ws
             asyncio.create_task(self._init_connection(ws))
             async for msg in ws:
                 try:
@@ -136,6 +159,7 @@ class KlippyBridgeConnection:
                 except json.JSONDecodeError:
                     continue
                 self._process_response(resp)
+        self.ws = None
 
     async def _init_connection(self, ws: websockets.WebSocketClientProtocol):
         # Identify Connection
@@ -251,6 +275,13 @@ class KlippyBridgeConnection:
         if temp is None:
             return
         last_temp, last_evt = self.last_temp
+        if self.is_mounted:
+            if eventtime > last_evt + MOUNTED_UPDATE_TIME:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._probe_location())
+                last_evt = eventtime
+            self.last_temp = (temp, last_evt)
+            return
         if temp >= last_temp + 1. or eventtime > last_evt + REQ_UPDATE_TIME:
             self.print_async(f"Temp update: Last temp: {last_temp}, New Temp: {temp}")
             self.last_temp = (temp, eventtime)
@@ -318,6 +349,19 @@ class KlippyBridgeConnection:
                 self.need_collect_ldc = True
                 self.ldc_data_queue.extend(data[i:])
                 break
+
+    async def _probe_location(self):
+        if self.ws is None:
+            return
+        probe_req, fut = self._build_request(
+            GCODE_REQUEST, {"script": MOUNTED_SCRIPT}
+        )
+        await self.ws.send(probe_req)
+        try:
+            await fut
+        except Exception as e:
+            print(f"Probe Request Return Error: {e}")
+        self.need_collect_ldc = True
 
     def print_async(self, msg: str):
         self._loop.run_in_executor(None, print, msg)
@@ -403,6 +447,10 @@ def main():
     parser.add_argument(
         "-z", "--plot-z", action="store_true",
         help="plot z height"
+    )
+    parser.add_argument(
+        "-m", "--mounted", action="store_true",
+        help="Plot data for a mounted probe"
     )
     parser.add_argument(
         "url", metavar="<moonraker url>",
