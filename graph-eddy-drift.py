@@ -88,9 +88,12 @@ G91
 G1 Z2 F600
 G90
 PROBE
+%s
 G4 P400
 M400
 """
+
+HEIGHT_SCRIPT = "G91\nG1 Z%f F600\nG90\n"
 
 class KlippyBridgeConnection:
     probe_data: deque[tuple[float, ...]] = deque(maxlen=10000)
@@ -114,6 +117,9 @@ class KlippyBridgeConnection:
         self.stock_cal_zpos: List[float] = []
         self.conn_task: Optional[asyncio.Task] = None
         self.is_mounted = args.mounted
+        self.lift_z = args.mounted_lift if self.is_mounted else 0
+        if self.lift_z < 0 or self.lift_z > 3.5:
+            raise Exception("Test height must be in the range of 0-3.5")
         self.ws: Optional[WSProto] = None
 
     def load_ldc1612_calibration(self, cal):
@@ -330,6 +336,9 @@ class KlippyBridgeConnection:
             )
         self.probe_data.append((temp, avg_freq, avg_z, stock_z))
         self.ldc_data_queue.clear()
+        if self.is_mounted and self.lift_z > 0:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._move_to_heating_pos())
 
     def _process_beacon_update(self, data: List[List[float]]):
         if self.need_collect_ldc:
@@ -353,8 +362,13 @@ class KlippyBridgeConnection:
     async def _probe_location(self):
         if self.ws is None:
             return
+        if self.lift_z:
+            hscript = HEIGHT_SCRIPT % (self.lift_z,)
+            script = MOUNTED_SCRIPT % (hscript,)
+        else:
+            script = MOUNTED_SCRIPT % ("",)
         probe_req, fut = self._build_request(
-            GCODE_REQUEST, {"script": MOUNTED_SCRIPT}
+            GCODE_REQUEST, {"script": script}
         )
         await self.ws.send(probe_req)
         try:
@@ -362,6 +376,17 @@ class KlippyBridgeConnection:
         except Exception as e:
             print(f"Probe Request Return Error: {e}")
         self.need_collect_ldc = True
+
+    async def _move_to_heating_pos(self):
+        if self.ws is None:
+            return
+        move_down_script = (
+            "G91\nG1 Z%f F300\nG90" % (-self.lift_z)
+        )
+        move_req, fut = self._build_request(
+            GCODE_REQUEST, {"script": move_down_script}
+        )
+        await self.ws.send(move_req)
 
     def print_async(self, msg: str):
         self._loop.run_in_executor(None, print, msg)
@@ -451,6 +476,10 @@ def main():
     parser.add_argument(
         "-m", "--mounted", action="store_true",
         help="Plot data for a mounted probe"
+    )
+    parser.add_argument(
+        "-l", "--mounted_lift", default=0, type=float,
+        help="Distance to lift mounted probes for samples"
     )
     parser.add_argument(
         "url", metavar="<moonraker url>",
